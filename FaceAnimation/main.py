@@ -4,11 +4,16 @@ import speech_recognition as sr
 import requests
 import base64
 import os
+import cv2
 import google.generativeai as genai
 import playsound
 import threading
 import string
 import webbrowser
+import face_recognition
+import time  # Import for cooldown tracking
+
+import time  # To track cooldown timings
 from config.api_keys import GOOGLE_API_KEY, GOOGLE_TTS  # Import keys from config file
 from config.keywords import appointment_kw, directions_kw, locations_kw  # Import keywords for appointment
 # https://docs.google.com/forms/d/e/1FAIpQLScUxWD43CuS1yu5PWTZmwPMAYypFzMi96_qZfhrOBJDYKbBUQ/viewform?usp=sf_link
@@ -27,6 +32,40 @@ model = genai.GenerativeModel(model_name="gemini-1.5-pro", generation_config=gen
 # Global variables
 in_greeting_zone = False
 stop_animation = threading.Event()  # Global flag to stop animation
+
+# Distance estimation constants
+KNOWN_WIDTH = 17.78  # cm (width of the face)
+FOCAL_LENGTH = 1063.09  # pixels (calibrated focal length)
+
+# Load Haar Cascade for face detection
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+# Load known faces and their names
+known_faces_path = "assets/Known_faces"
+known_faces_encodings = []
+known_faces_names = []
+
+greeted_timestamps = {}  # Tracks the last greeting time for each person
+cooldown_period = 10 # secs
+
+
+# Iterate over each file in the known faces directory
+for filename in os.listdir(known_faces_path):
+    if filename.lower().endswith((".jpg", ".png")):  # Check for valid image extensions
+        try:
+            # Load the image and extract the face encoding
+            image_path = os.path.join(known_faces_path, filename)
+            image = face_recognition.load_image_file(image_path)
+            encodings = face_recognition.face_encodings(image)
+
+            if encodings:
+                known_faces_encodings.append(encodings[0])  # Take the first encoding
+                known_faces_names.append(os.path.splitext(filename)[0])  # Use the filename without extension as the name
+                print(f"Loaded known face: {filename}")
+            else:
+                print(f"No face found in image: {filename}. Skipping.")
+        except Exception as e:
+            print(f"Error processing file {filename}: {e}")
 
 # Utility Functions
 def load_gif_frames(gif_path):
@@ -172,110 +211,166 @@ def handle_user_response(screen, talk_frames, neutral_face):
     """Handle the user's response after greeting."""
     recognizer = sr.Recognizer()
     with sr.Microphone() as source:
-        try:
-            print("Listening for user response...")
-            audio = recognizer.listen(source, timeout=5)
-            user_response = recognizer.recognize_google(audio).lower().strip()
-            print(f"User said: {user_response}")
-            
-            response_text = ""
+        while True:  # Keep listening until valid input or exit
+            try:
+                print("Listening for user response...")
+                audio = recognizer.listen(source, timeout=5)
+                user_response = recognizer.recognize_google(audio).lower().strip()
+                print(f"User said: {user_response}")
 
-            # Check if the user wants to book an appointment
-            if book_appointment(user_response):
-                talk_with_animation("Okay! You're here for an appointment. Please fill out the form on the screen and let me know when youre done.", screen, talk_frames, neutral_face)
-                form_url = "https://docs.google.com/forms/d/e/1FAIpQLScUxWD43CuS1yu5PWTZmwPMAYypFzMi96_qZfhrOBJDYKbBUQ/viewform?usp=sf_link"  # Replace with your form URL
-                webbrowser.open(form_url)
+                response_text = ""
 
-                    # Wait for user confirmation
-                while True:
-                    talk_with_animation("Please say 'I'm done' when you've finished the form.", screen, talk_frames, neutral_face)
-                    audio = recognizer.listen(source, timeout=10)  # Wait for a response
-                    response = recognizer.recognize_google(audio).lower().strip()
+                # Check if the user wants to book an appointment
+                if book_appointment(user_response):
+                    talk_with_animation("Okay! You're here for an appointment. Please fill out the form on the screen and let me know when you're done.", screen, talk_frames, neutral_face)
+                    form_url = "https://docs.google.com/forms/d/e/1FAIpQLScUxWD43CuS1yu5PWTZmwPMAYypFzMi96_qZfhrOBJDYKbBUQ/viewform?usp=sf_link"  # Replace with your form URL
+                    webbrowser.open(form_url)
 
-                    if response == "i'm done":
-                        talk_with_animation("Thank you! Someone will attend to you shortly. you can wait in the lobby behind you", screen, talk_frames, neutral_face)
-                        break
+                    while True:
+                        talk_with_animation("Please say 'I'm done' when you've finished the form.", screen, talk_frames, neutral_face)
+                        audio = recognizer.listen(source, timeout=10)
+                        response = recognizer.recognize_google(audio).lower().strip()
 
-            # Check if the user is asking for directions
-            elif directions(user_response):
-                print("Direction intent detected.")
+                        if response == "i'm done":
+                            talk_with_animation("Thank you! Someone will attend to you shortly. You can wait in the lobby behind you.", screen, talk_frames, neutral_face)
+                            return  # Exit the function after completing the interaction
 
-                # Ask the user for the specific location
-                talk_with_animation("Where would you like to go?", screen, talk_frames, neutral_face)
+                # Check if the user is asking for directions
+                elif directions(user_response):
+                    print("Direction intent detected.")
 
-                print("Listening for location...")
-                location_audio = recognizer.listen(source, timeout=5)
-                location_response = recognizer.recognize_google(location_audio).lower().strip()
-                print(f"User specified location: {location_response}")
+                    talk_with_animation("Where would you like to go?", screen, talk_frames, neutral_face)
 
-                # Match the location
-                matched_location = False
-                new_location = ""
-                for loc in locations_kw:
-                    print(loc)
-                    if loc in location_response:
-                        matched_location = True
-                        new_location = loc
-                        break
+                    print("Listening for location...")
+                    location_audio = recognizer.listen(source, timeout=5)
+                    location_response = recognizer.recognize_google(location_audio).lower().strip()
+                    print(f"User specified location: {location_response}")
 
-                if matched_location:
-                    # Provide location-specific response
-                    response_text = location(new_location)
-                    print(f"Matched location: {new_location}")
+                    response_text = location(location_response)
+                    talk_with_animation(response_text, screen, talk_frames, neutral_face)
+                    return  # Exit after providing directions
+
+                # Fallback if no intent is detected
                 else:
-                    # Inform the user the specific location is not found
-                    response_text = f"I'm sorry, but '{new_location}' is not available in this building."
-                    print(response_text)
+                    response_text = "I'm here to help if you need anything else."
+                    talk_with_animation(response_text, screen, talk_frames, neutral_face)
+                    return  # Exit after the fallback response
 
-            # Default fallback if no intent is detected
-            else:
-                response_text = "I'm here to help if you need anything else."
-            
-            # Speak and animate response
-            talk_with_animation(response_text, screen, talk_frames, neutral_face)
-        except sr.UnknownValueError:
-            print("Could not understand the audio input. Please try again.")
-            talk_with_animation("Sorry, I didn't catch that. Could you repeat?", screen, talk_frames, neutral_face)
-        except sr.WaitTimeoutError:
-            print("No input detected.")
-            talk_with_animation("I didn't hear you. Could you please repeat that?", screen, talk_frames, neutral_face)
-        except sr.RequestError as e:
-            print(f"Speech recognition service error: {e}")
-            talk_with_animation("There seems to be an issue with the speech service. Please try again later.", screen, talk_frames, neutral_face)
-        except Exception as e:
-            print(f"Unexpected error: {e}")
-            talk_with_animation("An unexpected error occurred. Please try again later.", screen, talk_frames, neutral_face)
+            except sr.UnknownValueError:
+                print("Could not understand the audio input. Retrying...")
+                talk_with_animation("Sorry, I didn't catch that. Could you repeat?", screen, talk_frames, neutral_face)
+            except sr.WaitTimeoutError:
+                print("No input detected. Retrying...")
+                talk_with_animation("I didn't hear you. Could you please repeat that?", screen, talk_frames, neutral_face)
+            except sr.RequestError as e:
+                print(f"Speech recognition service error: {e}")
+                talk_with_animation("There seems to be an issue with the speech service. Please try again later.", screen, talk_frames, neutral_face)
+                return  # Exit interaction due to an error
+            except Exception as e:
+                print(f"Unexpected error: {e}")
+                talk_with_animation("An unexpected error occurred. Please try again later.", screen, talk_frames, neutral_face)
+                return  # Exit interaction after an unexpected error
 
 
 # Main Function
-def main():
 
+def main():
     pygame.init()
     screen = pygame.display.set_mode((400, 400))
     clock = pygame.time.Clock()
 
     # Load assets
-    neutral_face = pygame.image.load("Gif/neutral.png")
-    blink_frames = load_gif_frames("Gif/Blinking.gif")
-    talk_frames = load_gif_frames("Gif/Talking.gif")
+    neutral_face = pygame.image.load("assets/Gif/neutral.png")
+    blink_frames = load_gif_frames("assets/Gif/Blinking.gif")
+    talk_frames = load_gif_frames("assets/Gif/Talking.gif")
 
     screen.blit(neutral_face, (0, 0))
     pygame.display.flip()
 
-    print("Press SPACEBAR to simulate user entering the greeting zone.")
+    print("Press 'q' to quit the robot.")
 
-    # Main loop
+    # Initialize the camera
+    cap = cv2.VideoCapture(0)
+
+    if not cap.isOpened():
+        print("Error: Unable to access the camera.")
+        return
+
+    # Cooldown and interaction variables
+    greeted_timestamps = {}  # Dictionary to track the last greeting time for each person
+    cooldown_period = 10  # Cooldown in seconds
+    in_interaction = False  # Flag to track if interaction is ongoing
+    current_user = None  # Track the name of the user in interaction
+
     running = True
     while running:
+        ret, frame = cap.read()
+        if not ret:
+            print("Camera feed unavailable. Exiting.")
+            break
+
+        # Convert to RGB for face_recognition
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        face_locations = face_recognition.face_locations(rgb_frame)
+        face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+
+        for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+            # Check for matches
+            matches = face_recognition.compare_faces(known_faces_encodings, face_encoding)
+            name = "Unknown"
+
+            if True in matches:
+                first_match_index = matches.index(True)
+                name = known_faces_names[first_match_index]
+
+            # Calculate distance
+            distance = (KNOWN_WIDTH * FOCAL_LENGTH) / (right - left)
+
+            current_time = time.time()
+
+            # Handle ongoing interaction
+            if in_interaction and name == current_user:
+                print(f"Skipping greeting for {name}, currently in interaction.")
+                continue
+
+            # Greet if within range and cooldown allows
+            if 50 <= distance <= 150:
+                if name not in greeted_timestamps or (current_time - greeted_timestamps[name] > cooldown_period):
+                    # Start interaction
+                    in_interaction = True
+                    current_user = name
+                    greeted_timestamps[name] = current_time
+
+                    # Greeting
+                    if name != "Unknown":
+                        greeting_text = f"Hi {name}! Welcome back to Telebot3 the receptionist. Are you here for an appointment or do you need directions?"
+                    else:
+                        greeting_text = "Hi there! Welcome to Telebot3 the receptionist. Are you here for an appointment, or do you need directions?"
+
+                    print(f"Greeting: {greeting_text} at {distance:.2f} cm.")
+                    talk_with_animation(greeting_text, screen, talk_frames, neutral_face)
+
+                    # Start handling the user's response
+                    handle_user_response(screen, talk_frames, neutral_face)
+
+                    # End interaction after the interaction flow
+                    in_interaction = False
+                    current_user = None
+
+        # Display the robot's neutral face continuously
+        screen.blit(neutral_face, (0, 0))
+        pygame.display.flip()
+
+        # Handle Pygame events and quit
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_SPACE:  # Trigger greeting on spacebar press
-                    greeting_zone(screen, talk_frames, neutral_face)
 
-        clock.tick(30)
+        # Break the loop when 'q' is pressed
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
 
+    cap.release()
     pygame.quit()
 
 
